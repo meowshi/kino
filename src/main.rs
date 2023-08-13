@@ -1,11 +1,18 @@
-use std::{collections::HashMap, env, process::exit};
+use std::{
+    collections::HashMap,
+    env::{self},
+    process::exit,
+    thread,
+    time::Duration,
+};
 
 use clap::Parser;
-use lazy_static::lazy_static;
-use reqwest::header::{HeaderMap, HeaderValue};
+use rand::Rng;
+
+use reqwest::header::HeaderMap;
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{stdout, AsyncBufReadExt, AsyncWriteExt, BufReader},
 };
 
 const GAME_HEADERS: [(&str, &str); 13] = [
@@ -39,39 +46,29 @@ const ANSWER_HEADERS: [(&str, &str); 12] = [
     ("sec-ch-ua-platform", "Windows"),
 ];
 
-lazy_static! {
-    static ref GAME_HEADERS_MAP: HeaderMap<HeaderValue> = {
-        let mut map = HeaderMap::new();
-        for header in &GAME_HEADERS {
-            map.insert(header.0, header.1.parse().unwrap());
-        }
-        map
-    };
-    static ref ANSWER_HEADERS_MAP: HeaderMap<HeaderValue> = {
-        let mut map = HeaderMap::new();
-        for header in &ANSWER_HEADERS {
-            map.insert(header.0, header.1.parse().unwrap());
-        }
-        map
-    };
+fn game_headers_map(cookie: &str) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for header in &GAME_HEADERS {
+        map.insert(header.0, header.1.parse().unwrap());
+    }
+    map.insert("Cookie", cookie.parse().unwrap());
+
+    map
+}
+
+fn answer_headers_map(cookie: &str) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for header in &ANSWER_HEADERS {
+        map.insert(header.0, header.1.parse().unwrap());
+    }
+    map.insert("Cookie", cookie.parse().unwrap());
+    map
 }
 
 async fn setup_answer_map(episode: &str) -> HashMap<i64, String> {
     let mut answers: HashMap<i64, String> = HashMap::new();
 
-    let file_name = format!("answers{episode}.txt");
-    let file = match File::open(&file_name).await {
-        Ok(file) => file,
-        Err(err) => match err.kind() {
-            std::io::ErrorKind::NotFound => File::create(&file_name).await.unwrap(),
-            _ => {
-                eprintln!("Не получилось создать или открыть файл {file_name}. Попробуйте создать его вручную.");
-                exit(0);
-            }
-        },
-    };
-
-    let answers_buf = BufReader::new(file);
+    let answers_buf = BufReader::new(File::open(format!("answers{}.txt", episode)).await.unwrap());
     let mut lines = answers_buf.lines();
     loop {
         let line = match lines.next_line().await {
@@ -82,15 +79,20 @@ async fn setup_answer_map(episode: &str) -> HashMap<i64, String> {
             Err(_) => break,
         };
 
-        let pair = line.split_once(' ').unwrap();
-        let id = pair.0.to_owned();
-        let name = pair.1.to_owned();
-
+        let first_space = line.find(' ').unwrap();
+        let id = line[0..first_space].to_owned();
+        let name = line[first_space + 1..line.len()].to_owned();
         answers.insert(id.parse().unwrap(), name);
     }
 
     answers
 }
+
+const MIN_RESULT_TIME: u64 = 2178;
+const MAX_RESULT_TIME: u64 = 9653;
+
+const MIN_ANSWER_TIME: u64 = 986;
+const MAX_ANSWER_TIME: u64 = 4465;
 
 #[derive(Parser)]
 struct Cli {
@@ -130,13 +132,18 @@ async fn main() {
         .await
         .unwrap();
 
-    let client = reqwest::Client::new();
+    let mut rng = rand::thread_rng();
 
+    let client = reqwest::Client::new();
     'game: loop {
+        stdout()
+            .write_all(format!("#НОВАЯ ИГРА#\n\n").as_bytes())
+            .await
+            .unwrap();
+
         let res: serde_json::Value = client
             .post("https://kp-guess-game-api.kinopoisk.ru/v1/games")
-            .headers(GAME_HEADERS_MAP.clone())
-            .header("Cookie", &cookie)
+            .headers(game_headers_map(&cookie))
             .body(format!("{{\"gameId\":{}}}", cli.episode))
             .send()
             .await
@@ -156,15 +163,29 @@ async fn main() {
             .unwrap();
 
         loop {
-            let default_answer = String::new();
-            let val = answers.get(&id).unwrap_or(&default_answer);
+            let default_answer = res
+                .get("stateData")
+                .unwrap()
+                .get("question")
+                .unwrap()
+                .get("answers")
+                .unwrap()
+                .as_array()
+                .unwrap()[0]
+                .as_str()
+                .unwrap()
+                .to_owned();
+
+            let (val, old) = match answers.get(&id) {
+                Some(val) => (val, true),
+                None => (&default_answer, false),
+            };
 
             let body = format!("{{\"answer\":{:?}}}", val);
             let res: serde_json::Value = client
                 .post("https://kp-guess-game-api.kinopoisk.ru/v1/questions/answers")
-                .headers(ANSWER_HEADERS_MAP.clone())
+                .headers(answer_headers_map(&cookie))
                 .header("Content-Lenght", &body.len().to_string())
-                .header("Cookie", &cookie)
                 .body(body)
                 .send()
                 .await
@@ -173,26 +194,68 @@ async fn main() {
                 .await
                 .unwrap();
 
-            if val.is_empty() {
+            if !res.get("isCorrect").unwrap().as_bool().unwrap() {
                 let correct_answer = res.get("correctAnswer").unwrap().as_str().unwrap();
                 answers.insert(id, correct_answer.to_owned());
                 answers_file
                     .write_all(format!("{id} {correct_answer}\n").as_bytes())
                     .await
                     .unwrap();
+
+                stdout()
+                    .write_all(format!("НОВЫЙ: {id} {correct_answer}\n").as_bytes())
+                    .await
+                    .unwrap();
+            } else if !old {
+                answers.insert(id, default_answer.to_owned());
+                answers_file
+                    .write_all(format!("{id} {default_answer}\n").as_bytes())
+                    .await
+                    .unwrap();
+            } else {
+                stdout()
+                    .write_all(format!("СТАРЫЙ: {id} {val}\n").as_bytes())
+                    .await
+                    .unwrap();
             }
 
             let state_data = res.get("stateData").unwrap();
 
+            let points = state_data.get("points").unwrap().as_i64().unwrap();
+
+            stdout()
+                .write_all(format!("ОЧКИ: {points}\n\n").as_bytes())
+                .await
+                .unwrap();
+
             id = match state_data.get("question") {
                 Some(val) => val.get("id").unwrap().as_i64().unwrap(),
                 None => match state_data.get("livesLeft").unwrap().as_i64().unwrap() {
-                    0 => continue 'game,
+                    0 => {
+                        stdout()
+                            .write_all(format!("ИГРА ОКОНЧЕНА. РЕЗУЛЬТАТ - {points}\n").as_bytes())
+                            .await
+                            .unwrap();
+                        stdout()
+                            .write_all(
+                                format!("ВСЕГО ОТВЕТОВ СОБРАНО: {}\n\n", answers.len()).as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+
+                        let waiting_time = rng.gen_range(MIN_RESULT_TIME..=MAX_RESULT_TIME);
+                        thread::sleep(Duration::from_millis(waiting_time));
+
+                        continue 'game;
+                    }
                     _ => break 'game,
                 },
             };
+
+            let waiting_time = rng.gen_range(MIN_ANSWER_TIME..=MAX_ANSWER_TIME);
+            thread::sleep(Duration::from_millis(waiting_time));
         }
     }
 
-    println!("Похоже вы ответили на все вопросы");
+    println!("Похоже вы ответили на все вопросы.");
 }
